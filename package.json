@@ -1,0 +1,17 @@
+{
+  "name": "lsports-ev-server",
+  "version": "1.0.0",
+  "description": "LSports Football EV Betting Server - Real-time odds and EV calculation",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.86.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2"
+  }
+}
