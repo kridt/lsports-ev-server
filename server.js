@@ -12,10 +12,53 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// ============ RATE LIMITING ============
+
+// Simple in-memory rate limiter for LSports API
+const rateLimiter = {
+  requests: [],
+  maxRequests: 10, // Max 10 requests per window
+  windowMs: 60 * 1000, // 1 minute window
+
+  canMakeRequest() {
+    const now = Date.now();
+    // Remove old requests outside the window
+    this.requests = this.requests.filter(time => now - time < this.windowMs);
+    return this.requests.length < this.maxRequests;
+  },
+
+  recordRequest() {
+    this.requests.push(Date.now());
+  },
+
+  getWaitTime() {
+    if (this.requests.length === 0) return 0;
+    const oldest = Math.min(...this.requests);
+    const waitTime = this.windowMs - (Date.now() - oldest);
+    return Math.max(0, waitTime);
+  }
+};
+
+// ============ HEALTH MONITORING ============
+
+let healthStatus = {
+  lsportsConnected: false,
+  lastLsportsCheck: null,
+  lastSuccessfulFetch: null,
+  consecutiveFailures: 0,
+  supabaseConnected: false,
+  serverStartTime: new Date().toISOString()
+};
+
 // ============ SUPABASE ============
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+// Validate required environment variables
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('❌ Missing required environment variables: SUPABASE_URL or SUPABASE_KEY');
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -26,8 +69,14 @@ const HOURS_BEFORE_KICKOFF = 48; // Only track bets within 48h of kickoff
 
 // ============ CONFIGURATION ============
 
+// Validate LSports credentials
+if (!process.env.LSPORTS_PACKAGE_ID || !process.env.LSPORTS_USERNAME || !process.env.LSPORTS_PASSWORD) {
+  console.error('❌ Missing required LSports credentials in environment variables!');
+  console.error('   Required: LSPORTS_PACKAGE_ID, LSPORTS_USERNAME, LSPORTS_PASSWORD');
+}
+
 const LSPORTS_CREDS = {
-  PackageId: parseInt(process.env.LSPORTS_PACKAGE_ID) || 3454,
+  PackageId: parseInt(process.env.LSPORTS_PACKAGE_ID),
   UserName: process.env.LSPORTS_USERNAME,
   Password: process.env.LSPORTS_PASSWORD
 };
@@ -156,13 +205,52 @@ function calculateMedian(numbers) {
     : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-async function fetchLSports(endpoint, body) {
-  const response = await fetch(`${LSPORTS_API_BASE}${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  return response.json();
+async function fetchLSports(endpoint, body, retries = 3) {
+  // Check rate limit
+  if (!rateLimiter.canMakeRequest()) {
+    const waitTime = rateLimiter.getWaitTime();
+    console.log(`[Rate Limit] Waiting ${waitTime}ms before next LSports request...`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+
+  rateLimiter.recordRequest();
+  healthStatus.lastLsportsCheck = new Date().toISOString();
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(`${LSPORTS_API_BASE}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+
+      // Update health status on success
+      healthStatus.lsportsConnected = true;
+      healthStatus.lastSuccessfulFetch = new Date().toISOString();
+      healthStatus.consecutiveFailures = 0;
+
+      return data;
+    } catch (error) {
+      console.error(`[LSports] Attempt ${attempt}/${retries} failed:`, error.message);
+      healthStatus.consecutiveFailures++;
+
+      if (attempt === retries) {
+        healthStatus.lsportsConnected = false;
+        throw error;
+      }
+
+      // Exponential backoff: 1s, 2s, 4s...
+      const backoffMs = Math.pow(2, attempt - 1) * 1000;
+      console.log(`[LSports] Retrying in ${backoffMs}ms...`);
+      await new Promise(resolve => setTimeout(resolve, backoffMs));
+    }
+  }
 }
 
 // ============ DATA STORAGE ============
@@ -182,22 +270,62 @@ let cachedData = {
   }
 };
 
+// Separate fixture cache (fixtures change less frequently)
+let fixtureCache = {
+  fixtures: [],
+  lastUpdated: null,
+  serverTimestamp: null, // Track for potential delta updates
+  ttlMs: 5 * 60 * 1000   // Cache fixtures for 5 minutes
+};
+
+// Track API response metadata for debugging
+let apiMetadata = {
+  lastFixturesResponse: null,
+  lastMarketsResponse: null,
+  lastServerTimestamp: null,
+  totalApiCalls: 0,
+  avgResponseTime: 0
+};
+
 // ============ MAIN EV CALCULATION ============
 
 async function fetchAndCalculateEV(leagueIds = null) {
+  const startTime = Date.now();
   console.log(`[${new Date().toISOString()}] Starting EV calculation...`);
   cachedData.isLoading = true;
   cachedData.error = null;
 
   try {
-    // Step 1: Get all fixtures
-    const fixturesRes = await fetchLSports('/PreMatch/GetFixtures', LSPORTS_CREDS);
-    const allFixtures = fixturesRes?.Body || [];
-
-    // Filter to target leagues and upcoming games
     const now = new Date();
     const targetLeagues = leagueIds || Object.keys(LSPORTS_LEAGUES).map(id => parseInt(id));
 
+    // Step 1: Get fixtures (use cache if fresh)
+    let allFixtures;
+    const fixtureCacheAge = fixtureCache.lastUpdated ? Date.now() - new Date(fixtureCache.lastUpdated).getTime() : Infinity;
+
+    if (fixtureCache.fixtures.length > 0 && fixtureCacheAge < fixtureCache.ttlMs) {
+      console.log(`[LSports] Using cached fixtures (age: ${Math.round(fixtureCacheAge / 1000)}s)`);
+      allFixtures = fixtureCache.fixtures;
+    } else {
+      console.log(`[LSports] Fetching fresh fixtures...`);
+      const fixturesRes = await fetchLSports('/PreMatch/GetFixtures', LSPORTS_CREDS);
+      allFixtures = fixturesRes?.Body || [];
+
+      // Update fixture cache
+      fixtureCache.fixtures = allFixtures;
+      fixtureCache.lastUpdated = new Date().toISOString();
+      fixtureCache.serverTimestamp = fixturesRes?.Header?.ServerTimestamp || null;
+
+      // Track metadata
+      apiMetadata.lastFixturesResponse = {
+        timestamp: new Date().toISOString(),
+        fixtureCount: allFixtures.length,
+        serverTimestamp: fixturesRes?.Header?.ServerTimestamp
+      };
+      apiMetadata.totalApiCalls++;
+    }
+
+    // Filter to target leagues and upcoming games
     const fixtures = allFixtures
       .map(e => {
         const fixture = e.Fixture || e;
@@ -231,14 +359,32 @@ async function fetchAndCalculateEV(leagueIds = null) {
 
     // Step 2: Get markets for all fixtures
     const fixtureIds = fixtures.map(f => f.fixtureId);
+    const marketsStartTime = Date.now();
     const marketsRes = await fetchLSports('/PreMatch/GetFixtureMarkets', {
       ...LSPORTS_CREDS,
       Fixtures: fixtureIds,
       Markets: Object.keys(LSPORTS_TARGET_MARKETS).map(id => parseInt(id))
     });
     const marketsEvents = marketsRes?.Body || [];
+    const marketsResponseTime = Date.now() - marketsStartTime;
 
-    console.log(`[LSports] Received markets for ${marketsEvents.length} events`);
+    // Track markets API metadata
+    apiMetadata.lastMarketsResponse = {
+      timestamp: new Date().toISOString(),
+      eventCount: marketsEvents.length,
+      fixtureCount: fixtureIds.length,
+      responseTimeMs: marketsResponseTime,
+      serverTimestamp: marketsRes?.Header?.ServerTimestamp
+    };
+    apiMetadata.lastServerTimestamp = marketsRes?.Header?.ServerTimestamp;
+    apiMetadata.totalApiCalls++;
+
+    // Update average response time
+    apiMetadata.avgResponseTime = apiMetadata.avgResponseTime
+      ? (apiMetadata.avgResponseTime + marketsResponseTime) / 2
+      : marketsResponseTime;
+
+    console.log(`[LSports] Received markets for ${marketsEvents.length} events (${marketsResponseTime}ms)`);
 
     // Step 3: Process each fixture and calculate EV
     const matches = [];
@@ -467,6 +613,68 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// Health monitoring endpoint
+app.get('/api/health', async (req, res) => {
+  const now = new Date();
+
+  // Check if data is stale (>10 minutes old)
+  const dataAge = cachedData.lastUpdated
+    ? (now - new Date(cachedData.lastUpdated)) / 1000 / 60
+    : null;
+  const isDataStale = dataAge === null || dataAge > 10;
+
+  // Check Supabase connectivity
+  try {
+    const { error } = await supabase.from('tracked_bets').select('id').limit(1);
+    healthStatus.supabaseConnected = !error;
+  } catch {
+    healthStatus.supabaseConnected = false;
+  }
+
+  // Determine overall health
+  const isHealthy = healthStatus.lsportsConnected &&
+                    healthStatus.supabaseConnected &&
+                    !isDataStale &&
+                    healthStatus.consecutiveFailures < 3;
+
+  const warnings = [];
+  if (isDataStale) warnings.push(`Data is stale (${dataAge?.toFixed(1) || 'N/A'} minutes old)`);
+  if (!healthStatus.lsportsConnected) warnings.push('LSports API disconnected');
+  if (!healthStatus.supabaseConnected) warnings.push('Supabase disconnected');
+  if (healthStatus.consecutiveFailures > 0) warnings.push(`${healthStatus.consecutiveFailures} consecutive failures`);
+
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'healthy' : 'unhealthy',
+    timestamp: now.toISOString(),
+    uptime: process.uptime(),
+    services: {
+      lsports: {
+        connected: healthStatus.lsportsConnected,
+        lastCheck: healthStatus.lastLsportsCheck,
+        lastSuccess: healthStatus.lastSuccessfulFetch,
+        consecutiveFailures: healthStatus.consecutiveFailures
+      },
+      supabase: {
+        connected: healthStatus.supabaseConnected
+      }
+    },
+    data: {
+      lastUpdated: cachedData.lastUpdated,
+      ageMinutes: dataAge?.toFixed(1) || null,
+      isStale: isDataStale,
+      matchCount: cachedData.matches?.length || 0,
+      betCount: cachedData.stats?.totalBets || 0
+    },
+    rateLimit: {
+      requestsInWindow: rateLimiter.requests.length,
+      maxRequests: rateLimiter.maxRequests,
+      windowMs: rateLimiter.windowMs
+    },
+    warnings,
+    serverStartTime: healthStatus.serverStartTime
+  });
+});
+
 // Force refresh
 app.post('/api/refresh', async (req, res) => {
   const leagues = req.body.leagues || null;
@@ -498,6 +706,109 @@ app.get('/api/markets', (req, res) => {
       id: parseInt(id),
       ...config
     }))
+  });
+});
+
+// Debug endpoint - API metadata and performance stats
+app.get('/api/debug', (req, res) => {
+  res.json({
+    success: true,
+    apiMetadata: {
+      ...apiMetadata,
+      fixtureCacheAge: fixtureCache.lastUpdated
+        ? Math.round((Date.now() - new Date(fixtureCache.lastUpdated).getTime()) / 1000) + 's'
+        : null,
+      fixtureCacheTTL: fixtureCache.ttlMs / 1000 + 's',
+      cachedFixtureCount: fixtureCache.fixtures.length
+    },
+    healthStatus,
+    rateLimit: {
+      requestsInWindow: rateLimiter.requests.length,
+      maxRequests: rateLimiter.maxRequests,
+      canMakeRequest: rateLimiter.canMakeRequest()
+    },
+    cache: {
+      matchCount: cachedData.matches?.length || 0,
+      bookmakerCount: cachedData.bookmakers?.length || 0,
+      lastUpdated: cachedData.lastUpdated
+    }
+  });
+});
+
+// Get scores for settlement (based on guide's GetScores pattern)
+app.get('/api/scores', async (req, res) => {
+  const { fixtureIds, fromDate, toDate } = req.query;
+
+  try {
+    // Build request body
+    const body = { ...LSPORTS_CREDS };
+
+    if (fixtureIds) {
+      body.Fixtures = fixtureIds.split(',').map(id => parseInt(id.trim()));
+    }
+    if (fromDate) {
+      body.FromDate = fromDate;
+    }
+    if (toDate) {
+      body.ToDate = toDate;
+    }
+
+    // The STM API doesn't have a dedicated GetScores endpoint,
+    // but we can get scores from GetFixtures with finished status
+    const response = await fetchLSports('/PreMatch/GetFixtures', body);
+    const events = response?.Body || [];
+
+    // Extract score information
+    const scores = events
+      .filter(e => e.Fixture?.Status === 3 || e.Livescore) // Status 3 = finished
+      .map(e => {
+        const fixture = e.Fixture || e;
+        const livescore = e.Livescore || {};
+        const scoreboard = livescore.Scoreboard || {};
+        const periods = livescore.Periods || [];
+
+        return {
+          fixtureId: e.FixtureId,
+          status: fixture.Status,
+          startDate: fixture.StartDate,
+          league: fixture.League?.Name,
+          home: fixture.Participants?.find(p => p.Position === "1" || p.Position === 1)?.Name,
+          away: fixture.Participants?.find(p => p.Position === "2" || p.Position === 2)?.Name,
+          score: {
+            home: scoreboard.HomeScore || null,
+            away: scoreboard.AwayScore || null,
+            status: scoreboard.Status,
+            currentPeriod: scoreboard.CurrentPeriod
+          },
+          periods: periods.map(p => ({
+            type: p.Type,
+            homeScore: p.HomeScore,
+            awayScore: p.AwayScore
+          }))
+        };
+      });
+
+    res.json({
+      success: true,
+      count: scores.length,
+      scores
+    });
+
+  } catch (error) {
+    console.error('[Scores] Error:', error.message);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// Clear fixture cache (force fresh fetch)
+app.post('/api/clear-cache', (req, res) => {
+  fixtureCache.fixtures = [];
+  fixtureCache.lastUpdated = null;
+  fixtureCache.serverTimestamp = null;
+
+  res.json({
+    success: true,
+    message: 'Fixture cache cleared. Next request will fetch fresh data.'
   });
 });
 
