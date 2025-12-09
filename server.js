@@ -205,6 +205,20 @@ function calculateMedian(numbers) {
     : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+// Normalize bookmaker names to consolidate regional variants
+function normalizeBookmaker(name) {
+  if (!name) return name;
+  // Consolidate Unibet regional variants (Unibet.fr, Unibet.de, etc.)
+  if (name.toLowerCase().startsWith('unibet')) return 'Unibet';
+  // Consolidate Bet365 variants
+  if (name.toLowerCase().startsWith('bet365')) return 'Bet365';
+  // Consolidate 1xBet variants
+  if (name.toLowerCase().includes('1xbet')) return '1XBet';
+  // Consolidate Betway variants
+  if (name.toLowerCase().startsWith('betway')) return 'BetWay';
+  return name;
+}
+
 async function fetchLSports(endpoint, body, retries = 3) {
   // Check rate limit
   if (!rateLimiter.canMakeRequest()) {
@@ -406,7 +420,7 @@ async function fetchAndCalculateEV(leagueIds = null) {
         const isPlayerShotsMarket = market.Id === 2351;
 
         for (const pm of (market.ProviderMarkets || [])) {
-          const bookmaker = pm.Name;
+          const bookmaker = normalizeBookmaker(pm.Name);
           allBookmakers.add(bookmaker);
 
           for (const bet of (pm.Bets || [])) {
