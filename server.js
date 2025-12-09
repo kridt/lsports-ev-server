@@ -1,16 +1,211 @@
 // LSports EV Server - Real-time Football EV Calculation
 // Refreshes every 1 minute and serves data to frontend
+// Now with WebSocket support for real-time notifications!
 
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { createServer } from 'http';
+import { Server as SocketIOServer } from 'socket.io';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
+const httpServer = createServer(app);
 const PORT = process.env.PORT || 3001;
+
+// Initialize Socket.IO with CORS
+const io = new SocketIOServer(httpServer, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
 
 app.use(cors());
 app.use(express.json());
+
+// ============ WEBSOCKET CLIENT TRACKING ============
+
+// Track connected clients and their preferences
+const connectedClients = new Map();
+
+io.on('connection', (socket) => {
+  console.log(`[WebSocket] Client connected: ${socket.id}`);
+
+  // Initialize client with default preferences
+  connectedClients.set(socket.id, {
+    selectedBookmakers: [],
+    notifyNewEV: true,
+    notifyEVIncrease: true,
+    notifyEVDrop: true,
+    minEVThreshold: 0,
+    evChangeThreshold: 2 // Notify when EV changes by more than 2%
+  });
+
+  // Client sends their preferences (selected bookmakers, notification settings)
+  socket.on('set-preferences', (prefs) => {
+    const client = connectedClients.get(socket.id);
+    if (client) {
+      connectedClients.set(socket.id, { ...client, ...prefs });
+      console.log(`[WebSocket] Client ${socket.id} updated preferences:`, prefs.selectedBookmakers?.length || 0, 'bookmakers');
+    }
+  });
+
+  // Client requests current data
+  socket.on('get-current-data', () => {
+    socket.emit('full-update', {
+      matches: cachedData.matches,
+      bookmakers: [...(cachedData.bookmakers || [])],
+      lastUpdated: cachedData.lastUpdated
+    });
+  });
+
+  socket.on('disconnect', () => {
+    connectedClients.delete(socket.id);
+    console.log(`[WebSocket] Client disconnected: ${socket.id}`);
+  });
+});
+
+// Store previous EV data for change detection
+let previousEVData = new Map(); // key: fixtureId_selection_bookmaker, value: { ev, odds }
+
+// ============ EV CHANGE DETECTION & NOTIFICATIONS ============
+
+function detectEVChangesAndNotify(matches) {
+  const currentEVData = new Map();
+  const notifications = {
+    newPositiveEV: [],    // New bets that just became +EV
+    evIncreased: [],      // Existing bets where EV increased significantly
+    evDropped: [],        // Existing bets where EV dropped significantly
+    newBets: []           // Completely new bets we haven't seen before
+  };
+
+  // Build current EV data map and detect changes
+  for (const match of matches) {
+    for (const bet of (match.valueBets || [])) {
+      for (const bm of (bet.allBookmakers || [])) {
+        const key = `${match.fixtureId}_${bet.selection}_${bm.bookmaker}`;
+        const currentData = {
+          ev: bm.ev,
+          odds: bm.odds,
+          match: `${match.homeTeam} vs ${match.awayTeam}`,
+          selection: bet.selection,
+          bookmaker: bm.bookmaker,
+          marketName: bet.marketName,
+          kickoff: match.kickoff,
+          fixtureId: match.fixtureId
+        };
+
+        currentEVData.set(key, currentData);
+
+        const previousData = previousEVData.get(key);
+
+        if (!previousData) {
+          // New bet we haven't seen
+          if (bm.ev > 0) {
+            notifications.newPositiveEV.push(currentData);
+          }
+        } else {
+          // Existing bet - check for changes
+          const evChange = bm.ev - previousData.ev;
+
+          if (evChange >= 2 && bm.ev > 0) {
+            // EV increased significantly
+            notifications.evIncreased.push({
+              ...currentData,
+              previousEV: previousData.ev,
+              change: evChange
+            });
+          } else if (evChange <= -2 && previousData.ev > 0) {
+            // EV dropped significantly
+            notifications.evDropped.push({
+              ...currentData,
+              previousEV: previousData.ev,
+              change: evChange
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Update previous data for next comparison
+  previousEVData = currentEVData;
+
+  // Send notifications to connected clients
+  sendNotificationsToClients(notifications);
+
+  return notifications;
+}
+
+function sendNotificationsToClients(notifications) {
+  const totalNotifications =
+    notifications.newPositiveEV.length +
+    notifications.evIncreased.length +
+    notifications.evDropped.length;
+
+  if (totalNotifications === 0) return;
+
+  console.log(`[WebSocket] Sending notifications: ${notifications.newPositiveEV.length} new +EV, ${notifications.evIncreased.length} increased, ${notifications.evDropped.length} dropped`);
+
+  // Send to each connected client based on their preferences
+  for (const [socketId, prefs] of connectedClients) {
+    const socket = io.sockets.sockets.get(socketId);
+    if (!socket) continue;
+
+    const clientNotifications = {
+      newPositiveEV: [],
+      evIncreased: [],
+      evDropped: [],
+      timestamp: new Date().toISOString()
+    };
+
+    // Filter by client's selected bookmakers
+    const hasBookmakerFilter = prefs.selectedBookmakers && prefs.selectedBookmakers.length > 0;
+
+    if (prefs.notifyNewEV) {
+      clientNotifications.newPositiveEV = notifications.newPositiveEV.filter(n => {
+        if (hasBookmakerFilter && !prefs.selectedBookmakers.includes(n.bookmaker)) return false;
+        if (n.ev < prefs.minEVThreshold) return false;
+        return true;
+      });
+    }
+
+    if (prefs.notifyEVIncrease) {
+      clientNotifications.evIncreased = notifications.evIncreased.filter(n => {
+        if (hasBookmakerFilter && !prefs.selectedBookmakers.includes(n.bookmaker)) return false;
+        if (Math.abs(n.change) < prefs.evChangeThreshold) return false;
+        return true;
+      });
+    }
+
+    if (prefs.notifyEVDrop) {
+      clientNotifications.evDropped = notifications.evDropped.filter(n => {
+        if (hasBookmakerFilter && !prefs.selectedBookmakers.includes(n.bookmaker)) return false;
+        if (Math.abs(n.change) < prefs.evChangeThreshold) return false;
+        return true;
+      });
+    }
+
+    // Only send if there are relevant notifications for this client
+    const clientTotal =
+      clientNotifications.newPositiveEV.length +
+      clientNotifications.evIncreased.length +
+      clientNotifications.evDropped.length;
+
+    if (clientTotal > 0) {
+      socket.emit('ev-notifications', clientNotifications);
+    }
+  }
+
+  // Also broadcast summary to all clients
+  io.emit('ev-update-summary', {
+    newPositiveEV: notifications.newPositiveEV.length,
+    evIncreased: notifications.evIncreased.length,
+    evDropped: notifications.evDropped.length,
+    timestamp: new Date().toISOString()
+  });
+}
 
 // ============ RATE LIMITING ============
 
@@ -560,6 +755,17 @@ async function fetchAndCalculateEV(leagueIds = null) {
     };
 
     console.log(`[LSports] EV calculation complete: ${matches.length} matches, ${allBets.length} bets, ${positiveBets.length} positive EV`);
+
+    // Detect EV changes and send WebSocket notifications
+    detectEVChangesAndNotify(matches);
+
+    // Broadcast full update to all connected clients
+    io.emit('full-update', {
+      matches: cachedData.matches,
+      bookmakers: cachedData.bookmakers,
+      lastUpdated: cachedData.lastUpdated,
+      stats: cachedData.stats
+    });
 
   } catch (error) {
     console.error('[LSports] Error:', error);
@@ -1589,14 +1795,14 @@ function startScheduler() {
 
 // ============ START SERVER ============
 
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
-║   LSports EV Server                                       ║
+║   LSports EV Server + WebSocket                           ║
 ║   Running on http://localhost:${PORT}                        ║
 ║                                                           ║
-║   Endpoints:                                              ║
+║   REST Endpoints:                                         ║
 ║   • GET  /api/ev-bets       - Get EV opportunities        ║
 ║   • GET  /api/status        - Server status               ║
 ║   • POST /api/refresh       - Force refresh               ║
@@ -1604,6 +1810,12 @@ app.listen(PORT, () => {
 ║   • GET  /api/markets       - Available markets           ║
 ║   • GET  /api/line-movement - Historical odds data        ║
 ║   • GET  /api/movers        - Bets with EV changes        ║
+║                                                           ║
+║   WebSocket Events (Socket.IO):                           ║
+║   • 'full-update'       - Complete data refresh           ║
+║   • 'ev-notifications'  - New/changed +EV bets            ║
+║   • 'ev-update-summary' - Summary of changes              ║
+║   • 'set-preferences'   - Set notification prefs          ║
 ║                                                           ║
 ║   Snapshots: Every ${SNAPSHOT_INTERVAL / 60000} min (EV >= ${MIN_EV_FOR_SNAPSHOT}%)                  ║
 ║   Refresh: ${REFRESH_INTERVAL / 1000}s | Storage: Supabase                    ║
