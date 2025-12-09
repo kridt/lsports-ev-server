@@ -955,6 +955,51 @@ app.get('/api/debug', (req, res) => {
   });
 });
 
+// Admin endpoint - WebSocket stats and connected clients
+app.get('/api/admin/websocket', (req, res) => {
+  const clients = [];
+
+  for (const [socketId, prefs] of connectedClients) {
+    const socket = io.sockets.sockets.get(socketId);
+    clients.push({
+      id: socketId,
+      connected: !!socket,
+      connectedAt: socket?.handshake?.time || null,
+      preferences: {
+        selectedBookmakers: prefs.selectedBookmakers || [],
+        notifyNewEV: prefs.notifyNewEV,
+        notifyEVIncrease: prefs.notifyEVIncrease,
+        notifyEVDrop: prefs.notifyEVDrop,
+        minEVThreshold: prefs.minEVThreshold,
+        evChangeThreshold: prefs.evChangeThreshold
+      }
+    });
+  }
+
+  // Get bookmaker popularity (which bookmakers are most selected)
+  const bookmakerPopularity = {};
+  clients.forEach(client => {
+    (client.preferences.selectedBookmakers || []).forEach(bm => {
+      bookmakerPopularity[bm] = (bookmakerPopularity[bm] || 0) + 1;
+    });
+  });
+
+  res.json({
+    success: true,
+    websocket: {
+      totalConnections: connectedClients.size,
+      activeConnections: clients.filter(c => c.connected).length,
+      clients: clients,
+      bookmakerPopularity: Object.entries(bookmakerPopularity)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, count]) => ({ bookmaker: name, subscribers: count })),
+      serverUptime: Math.round((Date.now() - new Date(healthStatus.serverStartTime).getTime()) / 1000),
+      lastEVUpdate: cachedData.lastUpdated,
+      previousEVDataSize: previousEVData.size
+    }
+  });
+});
+
 // Get scores for settlement (based on guide's GetScores pattern)
 app.get('/api/scores', async (req, res) => {
   const { fixtureIds, fromDate, toDate } = req.query;
