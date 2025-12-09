@@ -1000,6 +1000,81 @@ app.get('/api/admin/websocket', (req, res) => {
   });
 });
 
+// Admin endpoint - Send test notification to specific client
+app.post('/api/admin/test-notification', (req, res) => {
+  const { clientId, message } = req.body;
+
+  if (!clientId) {
+    return res.status(400).json({ success: false, error: 'clientId is required' });
+  }
+
+  const socket = io.sockets.sockets.get(clientId);
+
+  if (!socket) {
+    return res.status(404).json({ success: false, error: 'Client not connected' });
+  }
+
+  // Send test notification
+  const testNotification = {
+    type: 'test',
+    message: message || 'This is a test notification from Admin',
+    timestamp: new Date().toISOString(),
+    data: {
+      match: 'Test Match - Admin Panel',
+      homeTeam: 'Test Home',
+      awayTeam: 'Test Away',
+      market: 'Test Market',
+      selection: 'Test Selection',
+      bookmaker: 'TestBook',
+      odds: 2.50,
+      ev: 5.5,
+      previousEV: 3.2
+    }
+  };
+
+  socket.emit('ev-notifications', [testNotification]);
+
+  console.log(`📧 Test notification sent to client ${clientId.slice(0, 8)}...`);
+
+  res.json({
+    success: true,
+    message: `Test notification sent to ${clientId.slice(0, 12)}...`,
+    notification: testNotification
+  });
+});
+
+// Admin endpoint - Broadcast test notification to all clients
+app.post('/api/admin/broadcast-notification', (req, res) => {
+  const { message } = req.body;
+
+  const testNotification = {
+    type: 'test',
+    message: message || 'Broadcast test from Admin',
+    timestamp: new Date().toISOString(),
+    data: {
+      match: 'Broadcast Test',
+      homeTeam: 'All',
+      awayTeam: 'Clients',
+      market: 'Broadcast',
+      selection: 'Test',
+      bookmaker: 'Admin',
+      odds: 1.50,
+      ev: 10.0,
+      previousEV: 0
+    }
+  };
+
+  io.emit('ev-notifications', [testNotification]);
+
+  console.log(`📢 Broadcast notification sent to ${connectedClients.size} clients`);
+
+  res.json({
+    success: true,
+    message: `Broadcast sent to ${connectedClients.size} clients`,
+    notification: testNotification
+  });
+});
+
 // Get scores for settlement (based on guide's GetScores pattern)
 app.get('/api/scores', async (req, res) => {
   const { fixtureIds, fromDate, toDate } = req.query;
